@@ -1657,6 +1657,8 @@ export class TaskSpawner extends EventEmitter {
     private isReadyForInitialInput(str: string): boolean {
         return str.includes('Try "') ||
             str.includes('? for shortcuts') ||
+            str.includes('bypass permissions') ||
+            str.includes('shift+tab') ||
             (str.includes('───') && str.includes('❯'));
     }
 
@@ -1917,8 +1919,9 @@ export class TaskSpawner extends EventEmitter {
             // Paste the entire prompt at once, then use retry mechanism to ensure Enter is accepted
             task.process.write(prompt);
             task.promptSubmitAttempts = 0;
-            // Give more time for longer prompts to be written before sending Enter
-            const delayMs = Math.min(500 + Math.floor(prompt.length / 100) * 50, 1000);
+            // Give more time for longer prompts to be written before sending Enter.
+            // Scale: base 500ms + 50ms per 100 chars, capped at 2500ms (aligned with writeToTask).
+            const delayMs = Math.min(500 + Math.floor(prompt.length / 100) * 50, 2500);
             console.log(`[TaskSpawner] Waiting ${delayMs}ms before sending Enter for prompt of ${prompt.length} chars`);
             setTimeout(() => this.sendEnterWithRetry(task, maxRetries, { isInitialPrompt: true }), delayMs);
         }
