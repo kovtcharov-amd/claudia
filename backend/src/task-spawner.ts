@@ -328,18 +328,18 @@ export class TaskSpawner extends EventEmitter {
             ? envReapInterval
             : 10 * 60 * 1000;
 
-        // History file cap config. Default: rotate at 5MB, keep last 2MB tail.
-        // The 2MB floor matches MAX_HISTORY_SIZE for in-memory outputHistory,
-        // so a reconnect that reads the file has roughly the same context as
-        // a task that never disconnected.
+        // History file cap config. Default: rotate at 2MB, keep last 512KB tail.
+        // The 512KB keep-tail matches MAX_HISTORY_TO_SEND (what clients see)
+        // and MAX_RECONNECT_HISTORY (what we load on reconnect), so no memory
+        // is wasted storing history that will never be displayed.
         const envMaxBytes = parseInt(process.env.HISTORY_FILE_MAX_BYTES || '', 10);
         this.historyFileMaxBytes = !isNaN(envMaxBytes) && envMaxBytes >= 0
             ? envMaxBytes
-            : 5 * 1024 * 1024;
+            : 2 * 1024 * 1024;
         const envKeepBytes = parseInt(process.env.HISTORY_FILE_KEEP_BYTES || '', 10);
         this.historyFileKeepBytes = !isNaN(envKeepBytes) && envKeepBytes > 0
             ? envKeepBytes
-            : 2 * 1024 * 1024;
+            : 512 * 1024;
 
         // Initialize backend based on config
         this.backendType = configStore?.getBackend() || 'claude-code';
@@ -3882,23 +3882,32 @@ You are running as an agent inside Claudia, a multi-agent orchestrator. You have
         const now = new Date();
 
         // Preserve previous history so it can be shown when the task is selected.
-        // Load from disk file (primary) or in-memory persisted data (fallback).
+        // Only load the TAIL of the file (512KB max) since getCombinedHistory caps
+        // at 512KB when sending to clients anyway. Loading entire 5MB files wastes
+        // memory and can cause OOM with many active tasks.
+        const MAX_RECONNECT_HISTORY = 512 * 1024; // 512KB — matches MAX_HISTORY_TO_SEND
         let previousHistory: Buffer | undefined;
         try {
             const historyPath = this.getTaskHistoryPath(taskId);
             if (existsSync(historyPath)) {
-                const fileContent = readFileSync(historyPath, 'utf-8');
-                // Detect format (base64 vs raw text) using same heuristic as getCombinedHistory
-                const sample = fileContent.substring(0, 100);
-                const isRawText = sample.includes('\x1b') || sample.includes(' ') || sample.includes('[') || sample.includes(']');
-                if (isRawText) {
-                    previousHistory = Buffer.from(fileContent, 'utf-8');
+                const stat = statSync(historyPath);
+                if (stat.size <= MAX_RECONNECT_HISTORY) {
+                    const fileContent = readFileSync(historyPath, 'utf-8');
+                    const sample = fileContent.substring(0, 100);
+                    const isRawText = sample.includes('\x1b') || sample.includes(' ') || sample.includes('[') || sample.includes(']');
+                    previousHistory = isRawText
+                        ? Buffer.from(fileContent, 'utf-8')
+                        : Buffer.from(fileContent, 'base64');
                 } else {
-                    previousHistory = Buffer.from(fileContent, 'base64');
+                    // Large file — read only the tail
+                    const fd = openSync(historyPath, 'r');
+                    const buf = Buffer.alloc(MAX_RECONNECT_HISTORY);
+                    const offset = stat.size - MAX_RECONNECT_HISTORY;
+                    readSync(fd, buf, 0, MAX_RECONNECT_HISTORY, offset);
+                    closeSync(fd);
+                    previousHistory = buf;
+                    console.log(`[TaskSpawner] Large history file (${stat.size} bytes), loaded tail ${MAX_RECONNECT_HISTORY} bytes for ${taskId}`);
                 }
-                // Keep the file on disk until saveTasks() overwrites it.
-                // Deleting here creates a data loss window if the server crashes
-                // before saveTasks() runs.
                 console.log(`[TaskSpawner] Preserved ${previousHistory.length} bytes of history for ${taskId} on reconnect`);
             }
         } catch (e) {
