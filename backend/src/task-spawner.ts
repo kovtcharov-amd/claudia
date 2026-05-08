@@ -290,6 +290,12 @@ export class TaskSpawner extends EventEmitter {
      *  server, so the 24h window would fire immediately on every restart. */
     private readonly startedAt: Date = new Date();
 
+    /** Timestamp of the last polling tick. Used to detect system sleep/wake —
+     *  if more than SLEEP_DETECTION_GAP_MS has elapsed between ticks, the OS
+     *  was likely suspended and PTY child processes may have died. */
+    private lastPollTime: number = Date.now();
+    private static readonly SLEEP_DETECTION_GAP_MS = 30_000; // 30 seconds
+
     // Backend abstraction for multi-backend support (Claude Code, OpenCode, etc.)
     private backend: CodeBackend | null = null;
     private backendType: BackendType = 'claude-code';
@@ -941,6 +947,63 @@ export class TaskSpawner extends EventEmitter {
     }
 
     /**
+     * After detecting a system wake from sleep, reconnect tasks whose PTY
+     * processes died during the suspension. Only reconnects tasks that are
+     * now 'exited' but were alive (idle/busy/waiting_input) before sleep.
+     */
+    private async reconnectAfterSleep(): Promise<void> {
+        // Collect exited tasks that should be reconnected
+        const exitedTasks: string[] = [];
+        for (const task of this.tasks.values()) {
+            if (task.state === 'exited' && task.sessionId) {
+                exitedTasks.push(task.id);
+            }
+        }
+        // Also check disconnected tasks that were recently active
+        const disconnectedTasks: string[] = [];
+        for (const [id, task] of this.disconnectedTasks) {
+            if (task.sessionId && task.wasInterrupted) {
+                const lastActive = task.lastActivity ? new Date(task.lastActivity).getTime() : 0;
+                // Only reconnect tasks that were active in the last 2 hours
+                if (Date.now() - lastActive < 2 * 60 * 60 * 1000) {
+                    disconnectedTasks.push(id);
+                }
+            }
+        }
+
+        const total = exitedTasks.length + disconnectedTasks.length;
+        if (total === 0) return;
+
+        logger.info('Reconnecting tasks after system wake', {
+            exited: exitedTasks.length,
+            disconnected: disconnectedTasks.length,
+        });
+
+        // Disconnect exited tasks first (moves them to disconnectedTasks with session info)
+        for (const id of exitedTasks) {
+            try {
+                this.disconnectTask(id);
+            } catch (e) {
+                logger.warn('Failed to disconnect exited task for sleep reconnect', { taskId: id });
+            }
+        }
+
+        // Reconnect all in batches of 2
+        const allIds = [...exitedTasks, ...disconnectedTasks];
+        for (let i = 0; i < allIds.length; i++) {
+            try {
+                await this.reconnectTask(allIds[i]);
+                logger.info('Reconnected task after sleep', { taskId: allIds[i], index: i + 1, total: allIds.length });
+            } catch (e) {
+                logger.warn('Failed to reconnect task after sleep', { taskId: allIds[i], error: (e as Error).message });
+            }
+            if (i < allIds.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
+    }
+
+    /**
      * Start polling to check task states at the configured interval
      */
     private startStatePolling(): void {
@@ -958,6 +1021,18 @@ export class TaskSpawner extends EventEmitter {
      * Uses a per-task lock to prevent race conditions from concurrent state transitions.
      */
     private checkTaskStates(): void {
+        // Detect system sleep/wake: if the gap since last poll is much larger than
+        // the polling interval, the OS was suspended. PTY child processes often die
+        // during sleep, so we schedule auto-reconnect for any exited tasks.
+        const now = Date.now();
+        const gap = now - this.lastPollTime;
+        this.lastPollTime = now;
+        if (gap > TaskSpawner.SLEEP_DETECTION_GAP_MS) {
+            logger.info('System wake detected', { gapMs: gap, gapMinutes: Math.round(gap / 60_000) });
+            // Give PTY processes a moment to report their exit, then reconnect
+            setTimeout(() => this.reconnectAfterSleep(), 3000);
+        }
+
         // Number of consecutive polls with output changes required to transition idle → busy
         // This prevents spurious transitions from one-time terminal redraws (resize, focus, etc.)
         const CONSECUTIVE_CHANGES_FOR_BUSY = 2;
