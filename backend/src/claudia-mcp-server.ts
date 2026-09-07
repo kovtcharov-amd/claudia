@@ -28,6 +28,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { resolveRootWorkspaceId, scopedWorkspaceIds, type WorkspaceScopeEntry } from './workspace-scope.js';
 
 // Backend URL - defaults to localhost:4001, can be overridden via env
 const BACKEND_URL = process.env.CLAUDIA_BACKEND_URL || 'http://localhost:4001';
@@ -67,31 +68,43 @@ const log = {
 };
 
 /**
- * Get all workspace IDs that belong to the current workspace scope.
- * Includes the workspace itself plus any child worktree workspaces.
- * This ensures tasks in worktrees are visible to their parent workspace's MCP tools.
+ * Get all workspace IDs that belong to the current workspace scope: the root repo
+ * workspace plus all of its worktree children.
+ *
+ * Resolving upward first is what lets a task in an isolated worktree see its
+ * siblings. Scoping to WORKSPACE_ID alone returns only the caller's own task, which
+ * makes the duplicate-work check in claudia_list_tasks read as "nothing else is
+ * running" — see workspace-scope.ts.
  */
 async function getScopedWorkspaceIds(): Promise<Set<string>> {
-    const ids = new Set<string>();
-    if (!WORKSPACE_ID) return ids;
-    ids.add(WORKSPACE_ID);
+    if (!WORKSPACE_ID) return new Set<string>();
 
     try {
         const response = await backendFetch('/api/workspaces');
-        if (response.ok) {
-            const data = await response.json();
-            const workspaces = data.workspaces || data;
-            for (const ws of workspaces) {
-                if (ws.worktreeParentId === WORKSPACE_ID) {
-                    ids.add(ws.id);
-                }
-            }
+        if (!response.ok) {
+            log.error(
+                `Workspace scope: /api/workspaces returned HTTP ${response.status}. ` +
+                `Falling back to this workspace only (${WORKSPACE_ID}); sibling worktree ` +
+                `tasks will not be visible.`
+            );
+            return new Set([WORKSPACE_ID]);
         }
-    } catch {
-        // If workspace fetch fails, just use the direct workspace ID
-    }
 
-    return ids;
+        const data = await response.json();
+        const workspaces: WorkspaceScopeEntry[] = data.workspaces || data;
+        const rootId = resolveRootWorkspaceId(workspaces, WORKSPACE_ID);
+        const ids = scopedWorkspaceIds(workspaces, WORKSPACE_ID);
+
+        log.debug(`Workspace scope for ${WORKSPACE_ID}: root=${rootId}, ${ids.size} workspace(s) in scope`);
+        return ids;
+    } catch (error) {
+        log.error(
+            `Workspace scope: could not reach the Claudia backend at ${BACKEND_URL} ` +
+            `(${error instanceof Error ? error.message : String(error)}). Falling back to ` +
+            `this workspace only (${WORKSPACE_ID}); sibling worktree tasks will not be visible.`
+        );
+        return new Set([WORKSPACE_ID]);
+    }
 }
 
 /**
